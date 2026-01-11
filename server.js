@@ -1,22 +1,34 @@
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
+import nodemailer from "nodemailer";
 
 const app = express();
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
 const {
+  // Shopify
   SHOPIFY_WEBHOOK_SECRET = "",
-  SHOPIFY_SHOP_DOMAIN = "",     // example: yourstore.myshopify.com
+  SHOPIFY_SHOP_DOMAIN = "",     // مثال: yourstore.myshopify.com
   SHOPIFY_ADMIN_TOKEN = "",     // Admin API access token
+
+  // Binance
   BINANCE_API_KEY = "",
   BINANCE_API_SECRET = "",
-  SENDGRID_API_KEY = "",
+
+  // Zoho SMTP
+  SMTP_HOST = "smtp.zoho.com",
+  SMTP_PORT = "587",
+  SMTP_SECURE = "false",        // false لـ 587, true لـ 465
+  SMTP_USER = "",
+  SMTP_PASS = "",
   SENDER_EMAIL = "",
-  TEST_MODE = "true"            // keep true first
+
+  // Mode
+  TEST_MODE = "true"            // خليها true في الأول
 } = process.env;
 
-// ---------- Shopify HMAC verify ----------
+/* ---------------- Shopify HMAC verify ---------------- */
 function verifyShopifyWebhook(req) {
   const hmacHeader = req.get("X-Shopify-Hmac-Sha256") || "";
   const digest = crypto
@@ -30,31 +42,33 @@ function verifyShopifyWebhook(req) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// ---------- Shopify GraphQL helper ----------
+/* ---------------- Shopify GraphQL helper ---------------- */
 async function shopifyGraphQL(query, variables) {
-  const res = await fetch(`https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
-    },
-    body: JSON.stringify({ query, variables })
-  });
+  const res = await fetch(
+    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
+      },
+      body: JSON.stringify({ query, variables })
+    }
+  );
+
   const json = await res.json();
   if (!res.ok || json.errors) {
-    throw new Error(`Shopify GraphQL error: ${JSON.stringify(json.errors || json)}`);
+    throw new Error(
+      `Shopify GraphQL error: ${JSON.stringify(json.errors || json)}`
+    );
   }
   return json.data;
 }
 
-function orderGid(orderId) {
-  return `gid://shopify/Order/${orderId}`;
-}
-function productGid(productId) {
-  return `gid://shopify/Product/${productId}`;
-}
+const orderGid = (orderId) => `gid://shopify/Order/${orderId}`;
+const productGid = (productId) => `gid://shopify/Product/${productId}`;
 
-// ---------- Order idempotency (sent?) ----------
+/* ---------------- Idempotency (order already sent?) ---------------- */
 async function isOrderAlreadySent(orderId) {
   const q = `
     query($id: ID!) {
@@ -67,7 +81,7 @@ async function isOrderAlreadySent(orderId) {
   return data.order?.sent?.value === "true";
 }
 
-// ---------- Write order metafields (NO codes) ----------
+/* ---------------- Store order metafields (NO codes) ---------------- */
 async function setOrderMetafields(orderId, maskedRefs) {
   const m = `
     mutation($metafields: [MetafieldsSetInput!]!) {
@@ -76,9 +90,27 @@ async function setOrderMetafields(orderId, maskedRefs) {
   `;
 
   const metafields = [
-    { ownerId: orderGid(orderId), namespace: "bngc", key: "sent", type: "boolean", value: "true" },
-    { ownerId: orderGid(orderId), namespace: "bngc", key: "reference_nos", type: "multi_line_text_field", value: maskedRefs.join("\n") },
-    { ownerId: orderGid(orderId), namespace: "bngc", key: "sent_at", type: "date_time", value: new Date().toISOString() }
+    {
+      ownerId: orderGid(orderId),
+      namespace: "bngc",
+      key: "sent",
+      type: "boolean",
+      value: "true"
+    },
+    {
+      ownerId: orderGid(orderId),
+      namespace: "bngc",
+      key: "reference_nos",
+      type: "multi_line_text_field",
+      value: maskedRefs.join("\n")
+    },
+    {
+      ownerId: orderGid(orderId),
+      namespace: "bngc",
+      key: "sent_at",
+      type: "date_time",
+      value: new Date().toISOString()
+    }
   ];
 
   const data = await shopifyGraphQL(m, { metafields });
@@ -86,7 +118,7 @@ async function setOrderMetafields(orderId, maskedRefs) {
   if (errs.length) throw new Error(`MetafieldsSet error: ${JSON.stringify(errs)}`);
 }
 
-// ---------- Read product metafields ----------
+/* ---------------- Read product metafields ---------------- */
 async function getProductBngc(productId) {
   const q = `
     query($id: ID!) {
@@ -102,7 +134,7 @@ async function getProductBngc(productId) {
   return { enabled, costAmount };
 }
 
-// ---------- Binance helpers ----------
+/* ---------------- Binance helpers ---------------- */
 function signBinanceQuery(queryString, secret) {
   return crypto.createHmac("sha256", secret).update(queryString).digest("hex");
 }
@@ -114,7 +146,7 @@ function maskRef(ref) {
 }
 
 async function createBinanceGiftCard({ token, amount }) {
-  // TEST MODE: no Binance call
+  // TEST MODE: no Binance call (safe)
   if (TEST_MODE === "true") {
     return {
       success: true,
@@ -126,6 +158,10 @@ async function createBinanceGiftCard({ token, amount }) {
     };
   }
 
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+    throw new Error("Missing Binance env vars (BINANCE_API_KEY/BINANCE_API_SECRET)");
+  }
+
   const timestamp = Date.now();
   const params = new URLSearchParams({
     token,
@@ -134,7 +170,9 @@ async function createBinanceGiftCard({ token, amount }) {
   });
 
   const signature = signBinanceQuery(params.toString(), BINANCE_API_SECRET);
-  const url = `https://api.binance.com/sapi/v1/giftcard/createCode?${params.toString()}&signature=${signature}`;
+  const url =
+    `https://api.binance.com/sapi/v1/giftcard/createCode?` +
+    `${params.toString()}&signature=${signature}`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -146,35 +184,49 @@ async function createBinanceGiftCard({ token, amount }) {
   return json;
 }
 
-// ---------- Email (SendGrid) ----------
-async function sendEmailSendGrid({ to, subject, html }) {
-  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${SENDGRID_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      personalizations: [{ to: [{ email: to }] }],
-      from: { email: SENDER_EMAIL, name: "Shvilli" },
-      subject,
-      content: [{ type: "text/html", value: html }]
-    })
-  });
+/* ---------------- Email (Zoho SMTP via Nodemailer) ---------------- */
+function getSmtpTransporter() {
+  const port = Number(SMTP_PORT || 587);
+  const secure = String(SMTP_SECURE).toLowerCase() === "true";
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`SendGrid error ${res.status}: ${text}`);
-  }
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port,
+    secure, // true=465, false=587
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS
+    }
+  });
 }
 
+async function sendEmailSMTP({ to, subject, html }) {
+  if (!SMTP_USER || !SMTP_PASS || !SENDER_EMAIL) {
+    throw new Error("Missing SMTP env vars (SMTP_USER/SMTP_PASS/SENDER_EMAIL)");
+  }
+
+  const transporter = getSmtpTransporter();
+
+  await transporter.sendMail({
+    from: `"Shvilli" <${SENDER_EMAIL}>`,
+    to,
+    subject,
+    html
+  });
+}
+
+/* ---------------- Email HTML ---------------- */
 function buildEmailHtml({ codes, amountPerCode, token = "USDT" }) {
   const codeLines = codes
-    .map(c => `<div style="font-size:18px;font-weight:bold;letter-spacing:1px;margin:6px 0;">${c}</div>`)
+    .map(
+      (c) =>
+        `<div style="font-size:18px;font-weight:bold;letter-spacing:1px;margin:6px 0;">${c}</div>`
+    )
     .join("");
 
   return `<!DOCTYPE html>
-<html><body style="margin:0;background:#f3f4f6;">
+<html>
+<body style="margin:0;background:#f3f4f6;">
 <table width="100%" cellpadding="0" cellspacing="0" style="padding:30px 0;">
 <tr><td align="center">
 <table width="100%" style="max-width:600px;background:#ffffff;border-radius:14px;font-family:Arial,Helvetica,sans-serif;overflow:hidden;">
@@ -186,6 +238,7 @@ function buildEmailHtml({ codes, amountPerCode, token = "USDT" }) {
   </a>
 </td>
 </tr>
+
 <tr>
 <td style="padding:30px;color:#111827;font-size:14px;line-height:1.6;">
 <h2 style="text-align:center;margin-top:0;">Your Binance Gift Card</h2>
@@ -197,47 +250,58 @@ function buildEmailHtml({ codes, amountPerCode, token = "USDT" }) {
 </div>
 
 <p><strong>Amount per code:</strong> ${amountPerCode} ${token}</p>
-<p>Need help? <a href="mailto:support@shvilli.com" style="color:#2563eb;text-decoration:none;">support@shvilli.com</a></p>
+<p>Need help?
+<a href="mailto:support@shvilli.com" style="color:#2563eb;text-decoration:none;">support@shvilli.com</a>
+</p>
 </td>
 </tr>
+
 <tr>
 <td style="background:#f9fafb;padding:16px;text-align:center;font-size:13px;color:#6b7280;">
 ${new Date().getFullYear()} Shvilli.com – All rights reserved<br>
 This is an automated email, please do not reply.
 </td>
 </tr>
+
 </table>
 </td></tr></table>
-</body></html>`;
+</body>
+</html>`;
 }
 
-// ---------- Routes ----------
+/* ---------------- Routes ---------------- */
 app.get("/", (req, res) => res.send("BNGC server is running"));
 
 app.post("/webhooks/orders_paid", async (req, res) => {
   try {
+    // Basic checks
     if (!SHOPIFY_WEBHOOK_SECRET) return res.status(500).send("Missing SHOPIFY_WEBHOOK_SECRET");
     if (!SHOPIFY_SHOP_DOMAIN || !SHOPIFY_ADMIN_TOKEN) return res.status(500).send("Missing Shopify env vars");
 
+    // Verify Shopify signature
     if (!verifyShopifyWebhook(req)) return res.status(401).send("Invalid webhook signature");
 
     const order = JSON.parse(req.body.toString("utf8"));
     const orderId = order.id;
 
-    // idempotency
+    // Idempotency
     if (await isOrderAlreadySent(orderId)) {
       console.log("Already processed order:", orderId);
       return res.status(200).send("Already sent");
     }
 
     const customerEmail = order.email || order.customer?.email;
-    if (!customerEmail) return res.status(200).send("No email");
+    if (!customerEmail) {
+      console.log("No customer email for order:", orderId);
+      return res.status(200).send("No email");
+    }
 
     const token = "USDT";
     const allCodes = [];
     const maskedRefs = [];
     let amountPerCodeForEmail = null;
 
+    // Generate codes: qty => qty codes
     for (const item of order.line_items || []) {
       if (!item.product_id) continue;
 
@@ -252,7 +316,9 @@ app.post("/webhooks/orders_paid", async (req, res) => {
 
       for (let i = 0; i < qty; i++) {
         const result = await createBinanceGiftCard({ token, amount: unitAmount });
-        if (!result?.success || !result?.data?.code) throw new Error(`Giftcard failed: ${JSON.stringify(result)}`);
+        if (!result?.success || !result?.data?.code) {
+          throw new Error(`Giftcard failed: ${JSON.stringify(result)}`);
+        }
 
         allCodes.push(result.data.code);
         maskedRefs.push(maskRef(result.data.referenceNo || "N/A"));
@@ -264,22 +330,18 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       return res.status(200).send("No giftcard items");
     }
 
-    // Email codes (email only)
-    if (!SENDGRID_API_KEY || !SENDER_EMAIL) return res.status(500).send("Missing email env vars");
-
-    const html = buildEmailHtml({
-      codes: allCodes,
-      amountPerCode: amountPerCodeForEmail ?? "N/A",
-      token
-    });
-
-    await sendEmailSendGrid({
+    // Email only (Zoho SMTP)
+    await sendEmailSMTP({
       to: customerEmail,
       subject: "Your Binance Gift Card from Shvilli",
-      html
+      html: buildEmailHtml({
+        codes: allCodes,
+        amountPerCode: amountPerCodeForEmail ?? "N/A",
+        token
+      })
     });
 
-    // Store refs only (no codes)
+    // Store references only (NO codes)
     await setOrderMetafields(orderId, maskedRefs);
 
     console.log("SUCCESS order:", orderId, "codes:", allCodes.length);
