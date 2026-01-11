@@ -4,13 +4,26 @@ import fetch from "node-fetch";
 import nodemailer from "nodemailer";
 
 const app = express();
+
+/**
+ * IMPORTANT:
+ * - We need raw body ONLY for /webhooks to verify Shopify webhook HMAC.
+ * - For normal routes (OAuth), we can use default query parsing (no body needed).
+ */
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
 const {
-  // Shopify
+  // Shopify OAuth (NEW)
+  SHOPIFY_CLIENT_ID = "",
+  SHOPIFY_CLIENT_SECRET = "",
+  APP_URL = "https://bngc-shopify.onrender.com",
+
+  // Shopify Webhook + Shop domain
   SHOPIFY_WEBHOOK_SECRET = "",
-  SHOPIFY_SHOP_DOMAIN = "",     // مثال: yourstore.myshopify.com
-  SHOPIFY_ADMIN_TOKEN = "",     // Admin API access token
+  SHOPIFY_SHOP_DOMAIN = "", // e.g. shvilli-2.myshopify.com
+
+  // Optional legacy token (NOT required if OAuth used)
+  SHOPIFY_ADMIN_TOKEN = "",
 
   // Binance
   BINANCE_API_KEY = "",
@@ -19,48 +32,75 @@ const {
   // Zoho SMTP
   SMTP_HOST = "smtp.zoho.com",
   SMTP_PORT = "587",
-  SMTP_SECURE = "false",        // false لـ 587, true لـ 465
+  SMTP_SECURE = "false", // false for 587, true for 465
   SMTP_USER = "",
   SMTP_PASS = "",
   SENDER_EMAIL = "",
 
   // Mode
-  TEST_MODE = "true"            // خليها true في الأول
+  TEST_MODE = "true",
 } = process.env;
 
-/* ---------------- Shopify HMAC verify ---------------- */
+/**
+ * We'll store the OAuth access token in memory.
+ * NOTE: If Render restarts, you'll need to re-install (or store in DB).
+ */
+let SHOPIFY_OAUTH_TOKEN = "";
+
+/* ---------------- Utilities ---------------- */
+function timingSafeEqualStr(a, b) {
+  const aa = Buffer.from(String(a || ""), "utf8");
+  const bb = Buffer.from(String(b || ""), "utf8");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+/* ---------------- Shopify Webhook HMAC verify ---------------- */
 function verifyShopifyWebhook(req) {
   const hmacHeader = req.get("X-Shopify-Hmac-Sha256") || "";
   const digest = crypto
     .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
-    .update(req.body)
+    .update(req.body) // raw Buffer
     .digest("base64");
 
-  const a = Buffer.from(digest);
-  const b = Buffer.from(hmacHeader);
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  return timingSafeEqualStr(digest, hmacHeader);
+}
+
+/* ---------------- OAuth HMAC verify (callback) ---------------- */
+function verifyOAuthHmac(query) {
+  // Shopify sends hmac as hex. We must build message from query params excluding hmac & signature.
+  const { hmac, signature, ...rest } = query;
+
+  const message = Object.keys(rest)
+    .sort()
+    .map((k) => `${k}=${Array.isArray(rest[k]) ? rest[k].join(",") : rest[k]}`)
+    .join("&");
+
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+    .update(message)
+    .digest("hex");
+
+  return timingSafeEqualStr(digest, hmac);
 }
 
 /* ---------------- Shopify GraphQL helper ---------------- */
 async function shopifyGraphQL(query, variables) {
-  const res = await fetch(
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
-      },
-      body: JSON.stringify({ query, variables })
-    }
-  );
+  const tokenToUse = SHOPIFY_OAUTH_TOKEN || SHOPIFY_ADMIN_TOKEN;
+  if (!tokenToUse) throw new Error("Missing Shopify access token (OAuth not installed yet)");
 
-  const json = await res.json();
+  const res = await fetch(`https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": tokenToUse,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const json = await res.json().catch(() => ({}));
   if (!res.ok || json.errors) {
-    throw new Error(
-      `Shopify GraphQL error: ${JSON.stringify(json.errors || json)}`
-    );
+    throw new Error(`Shopify GraphQL error: ${JSON.stringify(json.errors || json)}`);
   }
   return json.data;
 }
@@ -95,22 +135,22 @@ async function setOrderMetafields(orderId, maskedRefs) {
       namespace: "bngc",
       key: "sent",
       type: "boolean",
-      value: "true"
+      value: "true",
     },
     {
       ownerId: orderGid(orderId),
       namespace: "bngc",
       key: "reference_nos",
       type: "multi_line_text_field",
-      value: maskedRefs.join("\n")
+      value: maskedRefs.join("\n"),
     },
     {
       ownerId: orderGid(orderId),
       namespace: "bngc",
       key: "sent_at",
       type: "date_time",
-      value: new Date().toISOString()
-    }
+      value: new Date().toISOString(),
+    },
   ];
 
   const data = await shopifyGraphQL(m, { metafields });
@@ -129,6 +169,7 @@ async function getProductBngc(productId) {
     }
   `;
   const data = await shopifyGraphQL(q, { id: productGid(productId) });
+
   const enabled = data.product?.enabled?.value === "true";
   const costAmount = data.product?.cost?.value ? Number(data.product.cost.value) : null;
   return { enabled, costAmount };
@@ -145,16 +186,17 @@ function maskRef(ref) {
   return s.slice(0, 4) + "****" + s.slice(-4);
 }
 
+/**
+ * Returns normalized shape:
+ * { code, referenceNo, expiredTime }
+ */
 async function createBinanceGiftCard({ token, amount }) {
   // TEST MODE: no Binance call (safe)
   if (TEST_MODE === "true") {
     return {
-      success: true,
-      data: {
-        code: `TEST-CODE-${Math.floor(100000 + Math.random() * 900000)}`,
-        referenceNo: `TEST-REF-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-        expiredTime: Date.now() + 30 * 24 * 60 * 60 * 1000
-      }
+      code: `TEST-CODE-${Math.floor(100000 + Math.random() * 900000)}`,
+      referenceNo: `TEST-REF-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      expiredTime: Date.now() + 30 * 24 * 60 * 60 * 1000,
     };
   }
 
@@ -166,7 +208,7 @@ async function createBinanceGiftCard({ token, amount }) {
   const params = new URLSearchParams({
     token,
     amount: String(amount),
-    timestamp: String(timestamp)
+    timestamp: String(timestamp),
   });
 
   const signature = signBinanceQuery(params.toString(), BINANCE_API_SECRET);
@@ -176,12 +218,20 @@ async function createBinanceGiftCard({ token, amount }) {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "X-MBX-APIKEY": BINANCE_API_KEY }
+    headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
   });
 
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Binance error ${res.status}: ${JSON.stringify(json)}`);
-  return json;
+
+  // Binance typically returns { code, referenceNo, expiredTime, ... }
+  if (!json.code) throw new Error(`Unexpected Binance response: ${JSON.stringify(json)}`);
+
+  return {
+    code: json.code,
+    referenceNo: json.referenceNo || "",
+    expiredTime: json.expiredTime || null,
+  };
 }
 
 /* ---------------- Email (Zoho SMTP via Nodemailer) ---------------- */
@@ -195,8 +245,8 @@ function getSmtpTransporter() {
     secure, // true=465, false=587
     auth: {
       user: SMTP_USER,
-      pass: SMTP_PASS
-    }
+      pass: SMTP_PASS,
+    },
   });
 }
 
@@ -211,7 +261,7 @@ async function sendEmailSMTP({ to, subject, html }) {
     from: `"Shvilli" <${SENDER_EMAIL}>`,
     to,
     subject,
-    html
+    html,
   });
 }
 
@@ -270,13 +320,82 @@ This is an automated email, please do not reply.
 }
 
 /* ---------------- Routes ---------------- */
-app.get("/", (req, res) => res.send("BNGC server is running"));
 
+// Health
+app.get("/", (req, res) => res.send("BNGC server is running ✅"));
+
+// Start OAuth install (open this)
+app.get("/auth/shopify", (req, res) => {
+  if (!SHOPIFY_SHOP_DOMAIN) return res.status(500).send("Missing SHOPIFY_SHOP_DOMAIN");
+  if (!SHOPIFY_CLIENT_ID) return res.status(500).send("Missing SHOPIFY_CLIENT_ID");
+  if (!APP_URL) return res.status(500).send("Missing APP_URL");
+
+  const scopes = "read_orders,write_metafields";
+  const redirectUri = `${APP_URL}/auth/shopify/callback`;
+  const state = crypto.randomBytes(16).toString("hex");
+
+  const installUrl =
+    `https://${SHOPIFY_SHOP_DOMAIN}/admin/oauth/authorize` +
+    `?client_id=${SHOPIFY_CLIENT_ID}` +
+    `&scope=${encodeURIComponent(scopes)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&state=${state}`;
+
+  return res.redirect(installUrl);
+});
+
+// OAuth callback (Shopify redirects here)
+app.get("/auth/shopify/callback", async (req, res) => {
+  try {
+    if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+      return res.status(500).send("Missing SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET");
+    }
+
+    // Verify HMAC
+    if (!verifyOAuthHmac(req.query)) {
+      return res.status(401).send("HMAC verification failed");
+    }
+
+    const { code, shop } = req.query;
+    if (!code || !shop) return res.status(400).send("Missing code/shop");
+
+    // Exchange code -> access token
+    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code,
+      }),
+    });
+
+    const tokenJson = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokenJson.access_token) {
+      return res.status(400).send(`Token error: ${JSON.stringify(tokenJson)}`);
+    }
+
+    SHOPIFY_OAUTH_TOKEN = tokenJson.access_token;
+
+    return res
+      .status(200)
+      .send("Installed OK ✅ Shopify token saved in server memory. You can test webhook now.");
+  } catch (e) {
+    console.error("OAuth callback error:", e?.message || e);
+    return res.status(500).send("OAuth callback error");
+  }
+});
+
+// Shopify webhook: orders paid
 app.post("/webhooks/orders_paid", async (req, res) => {
   try {
-    // Basic checks
     if (!SHOPIFY_WEBHOOK_SECRET) return res.status(500).send("Missing SHOPIFY_WEBHOOK_SECRET");
-    if (!SHOPIFY_SHOP_DOMAIN || !SHOPIFY_ADMIN_TOKEN) return res.status(500).send("Missing Shopify env vars");
+    if (!SHOPIFY_SHOP_DOMAIN) return res.status(500).send("Missing SHOPIFY_SHOP_DOMAIN");
+
+    // Must have token from OAuth OR legacy env token
+    if (!SHOPIFY_OAUTH_TOKEN && !SHOPIFY_ADMIN_TOKEN) {
+      return res.status(500).send("No Shopify access token. Install the app first: /auth/shopify");
+    }
 
     // Verify Shopify signature
     if (!verifyShopifyWebhook(req)) return res.status(401).send("Invalid webhook signature");
@@ -309,19 +428,17 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       if (!enabled) continue;
 
       const qty = Math.max(1, Number(item.quantity || 1));
-      const unitAmount = (costAmount && costAmount > 0) ? costAmount : Number(item.price || 0);
+      const unitAmount =
+        costAmount && costAmount > 0 ? costAmount : Number(item.price || 0);
       if (!unitAmount || unitAmount <= 0) continue;
 
       amountPerCodeForEmail = unitAmount;
 
       for (let i = 0; i < qty; i++) {
-        const result = await createBinanceGiftCard({ token, amount: unitAmount });
-        if (!result?.success || !result?.data?.code) {
-          throw new Error(`Giftcard failed: ${JSON.stringify(result)}`);
-        }
+        const gc = await createBinanceGiftCard({ token, amount: unitAmount });
 
-        allCodes.push(result.data.code);
-        maskedRefs.push(maskRef(result.data.referenceNo || "N/A"));
+        allCodes.push(gc.code);
+        maskedRefs.push(maskRef(gc.referenceNo || "N/A"));
       }
     }
 
@@ -337,8 +454,8 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       html: buildEmailHtml({
         codes: allCodes,
         amountPerCode: amountPerCodeForEmail ?? "N/A",
-        token
-      })
+        token,
+      }),
     });
 
     // Store references only (NO codes)
@@ -347,9 +464,12 @@ app.post("/webhooks/orders_paid", async (req, res) => {
     console.log("SUCCESS order:", orderId, "codes:", allCodes.length);
     return res.status(200).send("OK");
   } catch (e) {
-    console.error("ERROR:", e?.message || e);
+    console.error("WEBHOOK ERROR:", e?.message || e);
     return res.status(500).send("Error");
   }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log("Server started"));
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server started ✅");
+  console.log("Open install URL: /auth/shopify");
+});
