@@ -1,26 +1,37 @@
+/**
+ * BNGC Shopify -> Cloudflare Worker (Binance) -> Email + Metafields
+ * ✅ Binance keys stay ONLY in Cloudflare Worker
+ * ✅ Render only calls Worker using ACCESS_TOKEN (shared secret)
+ * ✅ Shopify webhook verified by SHOPIFY_WEBHOOK_SECRET
+ *
+ * Node 18+ (Render) / package.json: "type":"module"
+ */
+
 import express from "express";
 import crypto from "crypto";
 import fetch from "node-fetch";
 import nodemailer from "nodemailer";
 
 const app = express();
+
+// Shopify needs RAW body for webhook HMAC verification
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
 /* ---------------- ENV ---------------- */
 const {
   // Shopify (Required)
-  SHOPIFY_SHOP_DOMAIN = "",          // MUST be: shvilli-2.myshopify.com (no https)
-  SHOPIFY_WEBHOOK_SECRET = "",       // from Shopify webhook settings
-  SHOPIFY_ADMIN_TOKEN = "",          // your shpat_ token (persistent)
+  SHOPIFY_WEBHOOK_SECRET = "",
+  SHOPIFY_SHOP_DOMAIN = "",          // e.g. shvilli-2.myshopify.com (NO https)
+  SHOPIFY_ADMIN_TOKEN = "",          // shpat_...
 
-  // Shopify OAuth (Optional backup)
+  // Shopify OAuth installer (Optional - only if you want /auth/shopify)
   SHOPIFY_CLIENT_ID = "",
   SHOPIFY_CLIENT_SECRET = "",
   APP_URL = "https://bngc-shopify.onrender.com",
 
-  // Binance
-  BINANCE_API_KEY = "",
-  BINANCE_API_SECRET = "",
+  // Cloudflare Worker (Binance)
+  BNGC_WORKER_URL = "",              // https://binsecr.pureland-eg.workers.dev
+  BNGC_WORKER_SECRET = "",           // same value as Worker secret ACCESS_TOKEN
 
   // SMTP (Zoho)
   SMTP_HOST = "smtp.zoho.com",
@@ -31,26 +42,25 @@ const {
   SENDER_EMAIL = "",
 
   // Mode
-  TEST_MODE = "true",
+  TEST_MODE = "false"
 } = process.env;
 
-// In-memory oauth token (optional). Persistent is SHOPIFY_ADMIN_TOKEN
+// Optional OAuth token kept in memory (NOT persistent)
+// Use SHOPIFY_ADMIN_TOKEN for persistent.
 let SHOPIFY_OAUTH_TOKEN = "";
 
-/* ---------------- Helpers ---------------- */
+/* ---------------- Utils ---------------- */
 function normalizeShopDomain(domain) {
   return String(domain || "")
     .trim()
-    .replace(/^https?:\/\//i, "")   // remove http:// or https://
-    .replace(/^https\/\//i, "")     // remove malformed https//
-    .replace(/\/+$/, "");           // remove trailing /
+    .replace(/^https?:\/\//i, "")
+    .replace(/^https\/\//i, "")
+    .replace(/\/+$/, "");
 }
-
-function safeToken(token) {
-  // Prevent "Invalid character in header content"
-  return String(token || "").trim();
+function safeToken(v) {
+  // fixes: "Invalid character in header content"
+  return String(v || "").trim();
 }
-
 function timingSafeEqualStr(a, b) {
   const aa = Buffer.from(String(a || ""), "utf8");
   const bb = Buffer.from(String(b || ""), "utf8");
@@ -58,21 +68,21 @@ function timingSafeEqualStr(a, b) {
   return crypto.timingSafeEqual(aa, bb);
 }
 
-/* ---------------- Shopify Webhook HMAC verify ---------------- */
+/* ---------------- Shopify Webhook verify ---------------- */
 function verifyShopifyWebhook(req) {
   const hmacHeader = req.get("X-Shopify-Hmac-Sha256") || "";
   const digest = crypto
     .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
-    .update(req.body) // raw Buffer
+    .update(req.body) // raw buffer
     .digest("base64");
 
   return timingSafeEqualStr(digest, hmacHeader);
 }
 
-/* ---------------- Shopify OAuth HMAC verify (optional) ---------------- */
+/* ---------------- Shopify OAuth verify (optional) ---------------- */
 function verifyOAuthHmac(query) {
+  // Based on Shopify OAuth HMAC rules
   const { hmac, signature, ...rest } = query;
-
   const message = Object.keys(rest)
     .sort()
     .map((k) => `${k}=${Array.isArray(rest[k]) ? rest[k].join(",") : rest[k]}`)
@@ -91,7 +101,7 @@ async function shopifyGraphQL(query, variables) {
   const shop = normalizeShopDomain(SHOPIFY_SHOP_DOMAIN);
   const tokenToUse = safeToken(SHOPIFY_ADMIN_TOKEN) || safeToken(SHOPIFY_OAUTH_TOKEN);
 
-  if (!shop) throw new Error("Missing/invalid SHOPIFY_SHOP_DOMAIN (must be like shvilli-2.myshopify.com)");
+  if (!shop) throw new Error("Missing/invalid SHOPIFY_SHOP_DOMAIN (use: shvilli-2.myshopify.com)");
   if (!tokenToUse) throw new Error("Missing Shopify token. Set SHOPIFY_ADMIN_TOKEN in Render ENV.");
 
   const url = `https://${shop}/admin/api/2025-01/graphql.json`;
@@ -100,9 +110,9 @@ async function shopifyGraphQL(query, variables) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": tokenToUse,
+      "X-Shopify-Access-Token": tokenToUse
     },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({ query, variables })
   });
 
   const json = await res.json().catch(() => ({}));
@@ -115,7 +125,7 @@ async function shopifyGraphQL(query, variables) {
 const orderGid = (orderId) => `gid://shopify/Order/${orderId}`;
 const productGid = (productId) => `gid://shopify/Product/${productId}`;
 
-/* ---------------- Idempotency ---------------- */
+/* ---------------- Idempotency (order already sent?) ---------------- */
 async function isOrderAlreadySent(orderId) {
   const q = `
     query($id: ID!) {
@@ -142,22 +152,22 @@ async function setOrderMetafields(orderId, maskedRefs) {
       namespace: "bngc",
       key: "sent",
       type: "boolean",
-      value: "true",
+      value: "true"
     },
     {
       ownerId: orderGid(orderId),
       namespace: "bngc",
       key: "reference_nos",
       type: "multi_line_text_field",
-      value: maskedRefs.join("\n"),
+      value: maskedRefs.join("\n")
     },
     {
       ownerId: orderGid(orderId),
       namespace: "bngc",
       key: "sent_at",
       type: "date_time",
-      value: new Date().toISOString(),
-    },
+      value: new Date().toISOString()
+    }
   ];
 
   const data = await shopifyGraphQL(m, { metafields });
@@ -182,11 +192,7 @@ async function getProductBngc(productId) {
   return { enabled, costAmount };
 }
 
-/* ---------------- Binance helpers ---------------- */
-function signBinanceQuery(queryString, secret) {
-  return crypto.createHmac("sha256", secret).update(queryString).digest("hex");
-}
-
+/* ---------------- Cloudflare Worker (Binance) ---------------- */
 function maskRef(ref) {
   const s = String(ref || "");
   if (s.length <= 8) return "****";
@@ -194,47 +200,42 @@ function maskRef(ref) {
 }
 
 /**
- * Returns normalized: { code, referenceNo, expiredTime? }
+ * Expect Worker returns Binance JSON like:
+ * { code: "...", referenceNo: "...", expiredTime: ... }  (or {success:true,data:{...}} if you did that)
  */
-async function createBinanceGiftCard({ token, amount }) {
+async function createBinanceGiftCardViaWorker({ token, amount }) {
+  // TEST mode: local fake codes
   if (String(TEST_MODE).toLowerCase() === "true") {
     return {
       code: `TEST-CODE-${Math.floor(100000 + Math.random() * 900000)}`,
       referenceNo: `TEST-REF-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      expiredTime: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      expiredTime: Date.now() + 30 * 24 * 60 * 60 * 1000
     };
   }
 
-  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
-    throw new Error("Missing Binance env vars (BINANCE_API_KEY/BINANCE_API_SECRET)");
+  if (!BNGC_WORKER_URL || !BNGC_WORKER_SECRET) {
+    throw new Error("Missing BNGC_WORKER_URL or BNGC_WORKER_SECRET in Render ENV");
   }
 
-  const timestamp = Date.now();
-  const params = new URLSearchParams({
-    token,
-    amount: String(amount),
-    timestamp: String(timestamp),
-  });
-
-  const signature = signBinanceQuery(params.toString(), BINANCE_API_SECRET);
-  const url =
-    `https://api.binance.com/sapi/v1/giftcard/createCode?` +
-    `${params.toString()}&signature=${signature}`;
-
-  const res = await fetch(url, {
+  const res = await fetch(BNGC_WORKER_URL, {
     method: "POST",
-    headers: { "X-MBX-APIKEY": BINANCE_API_KEY },
+    headers: {
+      "Content-Type": "application/json",
+      "X-BNGC-AUTH": BNGC_WORKER_SECRET
+    },
+    body: JSON.stringify({ token, amount })
   });
 
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Binance error ${res.status}: ${JSON.stringify(json)}`);
-  if (!json.code) throw new Error(`Unexpected Binance response: ${JSON.stringify(json)}`);
+  if (!res.ok) {
+    throw new Error(`Cloudflare Worker error ${res.status}: ${JSON.stringify(json)}`);
+  }
 
-  return {
-    code: json.code,
-    referenceNo: json.referenceNo || "",
-    expiredTime: json.expiredTime || null,
-  };
+  // Support two formats:
+  // 1) direct Binance: { code, referenceNo, expiredTime }
+  // 2) wrapped: { success:true, data:{...} }
+  if (json?.success && json?.data) return json.data;
+  return json;
 }
 
 /* ---------------- SMTP ---------------- */
@@ -247,8 +248,8 @@ function getSmtpTransporter() {
     secure,
     auth: {
       user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
+      pass: SMTP_PASS
+    }
   });
 }
 
@@ -262,14 +263,17 @@ async function sendEmailSMTP({ to, subject, html }) {
     from: `"Shvilli" <${SENDER_EMAIL}>`,
     to,
     subject,
-    html,
+    html
   });
 }
 
 /* ---------------- Email HTML ---------------- */
 function buildEmailHtml({ codes, amountPerCode, token = "USDT" }) {
   const codeLines = codes
-    .map((c) => `<div style="font-size:18px;font-weight:bold;letter-spacing:1px;margin:6px 0;">${c}</div>`)
+    .map(
+      (c) =>
+        `<div style="font-size:18px;font-weight:bold;letter-spacing:1px;margin:6px 0;">${c}</div>`
+    )
     .join("");
 
   return `<!DOCTYPE html>
@@ -298,7 +302,9 @@ function buildEmailHtml({ codes, amountPerCode, token = "USDT" }) {
 </div>
 
 <p><strong>Amount per code:</strong> ${amountPerCode} ${token}</p>
-<p>Need help? <a href="mailto:support@shvilli.com" style="color:#2563eb;text-decoration:none;">support@shvilli.com</a></p>
+<p>Need help?
+<a href="mailto:support@shvilli.com" style="color:#2563eb;text-decoration:none;">support@shvilli.com</a>
+</p>
 </td>
 </tr>
 
@@ -308,6 +314,7 @@ ${new Date().getFullYear()} Shvilli.com – All rights reserved<br>
 This is an automated email, please do not reply.
 </td>
 </tr>
+
 </table>
 </td></tr></table>
 </body>
@@ -318,8 +325,8 @@ This is an automated email, please do not reply.
 app.get("/", (req, res) => res.send("BNGC server is running ✅"));
 
 /**
- * OPTIONAL: OAuth installer (backup)
- * IMPORTANT: scopes here are the correct ones (no write_metafields).
+ * OPTIONAL OAuth installer
+ * If you already have SHOPIFY_ADMIN_TOKEN (shpat_), you can ignore this.
  */
 app.get("/auth/shopify", (req, res) => {
   const shop = normalizeShopDomain(SHOPIFY_SHOP_DOMAIN);
@@ -327,7 +334,7 @@ app.get("/auth/shopify", (req, res) => {
   if (!SHOPIFY_CLIENT_ID) return res.status(500).send("Missing SHOPIFY_CLIENT_ID");
   if (!APP_URL) return res.status(500).send("Missing APP_URL");
 
-  // ✅ Correct scopes (fix for your ACCESS_DENIED)
+  // ✅ Correct scopes
   const scopes = "read_orders,write_orders,read_products";
 
   const redirectUri = `${APP_URL}/auth/shopify/callback`;
@@ -359,8 +366,8 @@ app.get("/auth/shopify/callback", async (req, res) => {
       body: JSON.stringify({
         client_id: SHOPIFY_CLIENT_ID,
         client_secret: SHOPIFY_CLIENT_SECRET,
-        code,
-      }),
+        code
+      })
     });
 
     const tokenJson = await tokenRes.json().catch(() => ({}));
@@ -370,7 +377,7 @@ app.get("/auth/shopify/callback", async (req, res) => {
 
     SHOPIFY_OAUTH_TOKEN = tokenJson.access_token;
 
-    // show token so you can paste into Render ENV as SHOPIFY_ADMIN_TOKEN
+    // Show token so you can paste into Render ENV as SHOPIFY_ADMIN_TOKEN
     return res.status(200).send(`
       <h2>✅ Installed OK</h2>
       <p>Copy this token and paste into Render ENV as <code>SHOPIFY_ADMIN_TOKEN</code>, then redeploy.</p>
@@ -383,14 +390,16 @@ app.get("/auth/shopify/callback", async (req, res) => {
 });
 
 /**
- * Webhook: orders paid
- * URL must be exactly: https://bngc-shopify.onrender.com/webhooks/orders_paid
+ * Shopify webhook: orders/paid
+ * URL example: https://bngc-shopify.onrender.com/webhooks/orders_paid
  */
 app.post("/webhooks/orders_paid", async (req, res) => {
   try {
     if (!SHOPIFY_WEBHOOK_SECRET) return res.status(500).send("Missing SHOPIFY_WEBHOOK_SECRET");
+    if (!SHOPIFY_SHOP_DOMAIN) return res.status(500).send("Missing SHOPIFY_SHOP_DOMAIN");
+    if (!SHOPIFY_ADMIN_TOKEN && !SHOPIFY_OAUTH_TOKEN) return res.status(500).send("Missing Shopify token");
 
-    // Verify webhook signature
+    // Verify Shopify signature
     if (!verifyShopifyWebhook(req)) return res.status(401).send("Invalid webhook signature");
 
     const order = JSON.parse(req.body.toString("utf8"));
@@ -413,7 +422,7 @@ app.post("/webhooks/orders_paid", async (req, res) => {
     const maskedRefs = [];
     let amountPerCodeForEmail = null;
 
-    // Generate: qty => qty codes for BNGC-enabled products only
+    // Generate codes: qty => qty codes for products with bngc.enabled = true
     for (const item of order.line_items || []) {
       if (!item.product_id) continue;
 
@@ -427,7 +436,12 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       amountPerCodeForEmail = unitAmount;
 
       for (let i = 0; i < qty; i++) {
-        const gc = await createBinanceGiftCard({ token, amount: unitAmount });
+        const gc = await createBinanceGiftCardViaWorker({ token, amount: unitAmount });
+
+        if (!gc?.code) {
+          throw new Error(`Giftcard failed (no code): ${JSON.stringify(gc)}`);
+        }
+
         allCodes.push(gc.code);
         maskedRefs.push(maskRef(gc.referenceNo || "N/A"));
       }
@@ -438,18 +452,18 @@ app.post("/webhooks/orders_paid", async (req, res) => {
       return res.status(200).send("No giftcard items");
     }
 
-    // Send email with codes
+    // Email with codes
     await sendEmailSMTP({
       to: customerEmail,
       subject: "Your Binance Gift Card from Shvilli",
       html: buildEmailHtml({
         codes: allCodes,
         amountPerCode: amountPerCodeForEmail ?? "N/A",
-        token,
-      }),
+        token
+      })
     });
 
-    // Store masked refs only (NO codes)
+    // Store references only (NO codes)
     await setOrderMetafields(orderId, maskedRefs);
 
     console.log("SUCCESS order:", orderId, "codes:", allCodes.length);
@@ -463,4 +477,5 @@ app.post("/webhooks/orders_paid", async (req, res) => {
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server started ✅");
   console.log("Shop domain:", normalizeShopDomain(SHOPIFY_SHOP_DOMAIN));
+  console.log("Worker URL:", BNGC_WORKER_URL ? "set ✅" : "missing ❌");
 });
