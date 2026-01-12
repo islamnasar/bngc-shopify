@@ -4,8 +4,6 @@ import fetch from "node-fetch";
 import nodemailer from "nodemailer";
 
 const app = express();
-
-// RAW body فقط للويبهوكس (عشان HMAC)
 app.use("/webhooks", express.raw({ type: "application/json" }));
 
 /* ---------------- ENV ---------------- */
@@ -321,7 +319,7 @@ app.get("/", (req, res) => res.send("BNGC server is running ✅"));
 
 /**
  * OPTIONAL: OAuth installer (backup)
- * Use only if you ever need to re-generate token.
+ * IMPORTANT: scopes here are the correct ones (no write_metafields).
  */
 app.get("/auth/shopify", (req, res) => {
   const shop = normalizeShopDomain(SHOPIFY_SHOP_DOMAIN);
@@ -329,7 +327,9 @@ app.get("/auth/shopify", (req, res) => {
   if (!SHOPIFY_CLIENT_ID) return res.status(500).send("Missing SHOPIFY_CLIENT_ID");
   if (!APP_URL) return res.status(500).send("Missing APP_URL");
 
-  const scopes = "read_orders,read_products,write_metafields";
+  // ✅ Correct scopes (fix for your ACCESS_DENIED)
+  const scopes = "read_orders,write_orders,read_products";
+
   const redirectUri = `${APP_URL}/auth/shopify/callback`;
   const state = crypto.randomBytes(16).toString("hex");
 
@@ -370,9 +370,10 @@ app.get("/auth/shopify/callback", async (req, res) => {
 
     SHOPIFY_OAUTH_TOKEN = tokenJson.access_token;
 
+    // show token so you can paste into Render ENV as SHOPIFY_ADMIN_TOKEN
     return res.status(200).send(`
       <h2>✅ Installed OK</h2>
-      <p>This token is temporary (server memory). Better: copy it and set it as <code>SHOPIFY_ADMIN_TOKEN</code> in Render ENV.</p>
+      <p>Copy this token and paste into Render ENV as <code>SHOPIFY_ADMIN_TOKEN</code>, then redeploy.</p>
       <textarea style="width:100%;max-width:900px;height:120px;">${SHOPIFY_OAUTH_TOKEN}</textarea>
     `);
   } catch (e) {
